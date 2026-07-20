@@ -12,7 +12,7 @@ import vtkRenderPass from 'vtk.js/Sources/Rendering/SceneGraph/RenderPass';
 import vtkRenderWindowViewNode from 'vtk.js/Sources/Rendering/SceneGraph/RenderWindowViewNode';
 import { createContextProxyHandler } from 'vtk.js/Sources/Rendering/OpenGL/RenderWindow/ContextProxy';
 
-const { vtkDebugMacro, vtkErrorMacro } = macro;
+const { vtkDebugMacro, vtkErrorMacro, vtkWarningMacro } = macro;
 
 const SCREENSHOT_PLACEHOLDER = {
   position: 'absolute',
@@ -33,7 +33,6 @@ const parentMethodsToProxy = [
   'getContext',
   'getDefaultTextureByteSize',
   'getDefaultTextureInternalFormat',
-  'getDefaultToWebgl2',
   'getGLInformations',
   'getGraphicsMemoryInfo',
   'getGraphicsResourceForObject',
@@ -42,7 +41,6 @@ const parentMethodsToProxy = [
   'getShaderCache',
   'getTextureUnitForTexture',
   'getTextureUnitManager',
-  'getWebgl2',
   'makeCurrent',
   'releaseGraphicsResources',
   'registerGraphicsResourceUser',
@@ -50,17 +48,22 @@ const parentMethodsToProxy = [
   'restoreContext',
   'setActiveFramebuffer',
   'setContext',
-  'setDefaultToWebgl2',
   'setGraphicsResourceForObject',
 ];
 
-function checkRenderTargetSupport(gl, format, type) {
+function checkRenderTargetSupport(gl, internalFormat, format, type) {
+  // This probe can run mid render (getGLInformations is called lazily, e.g.
+  // from useTexStorage while a texture is being created), so it must leave
+  // every binding exactly as it found it.
+  const previousTexture = gl.getParameter(gl.TEXTURE_BINDING_2D);
+  const previousFramebuffer = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+
   // create temporary frame buffer and texture
   const framebuffer = gl.createFramebuffer();
   const texture = gl.createTexture();
 
   gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.texImage2D(gl.TEXTURE_2D, 0, format, 2, 2, 0, format, type, null);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internalFormat, 2, 2, 0, format, type, null);
 
   gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
   gl.framebufferTexture2D(
@@ -74,9 +77,11 @@ function checkRenderTargetSupport(gl, format, type) {
   // check frame buffer status
   const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
 
-  // clean up
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  gl.bindTexture(gl.TEXTURE_2D, null);
+  // clean up and restore previous state
+  gl.bindFramebuffer(gl.FRAMEBUFFER, previousFramebuffer);
+  gl.bindTexture(gl.TEXTURE_2D, previousTexture);
+  gl.deleteFramebuffer(framebuffer);
+  gl.deleteTexture(texture);
 
   return status === gl.FRAMEBUFFER_COMPLETE;
 }
@@ -129,20 +134,23 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
 
   publicAPI.getViewNodeFactory = () => model.myFactory;
 
-  // prevent default context lost handler
-  model.canvas.addEventListener('webglcontextlost', _preventDefault, false);
+  // prevent default context lost handler; an externally owned canvas
+  // (manageCanvas=false) keeps its host's context-loss handling
+  if (model.manageCanvas) {
+    model.canvas.addEventListener('webglcontextlost', _preventDefault, false);
 
-  model.canvas.addEventListener(
-    'webglcontextrestored',
-    publicAPI.restoreContext,
-    false
-  );
+    model.canvas.addEventListener(
+      'webglcontextrestored',
+      publicAPI.restoreContext,
+      false
+    );
+  }
 
   // Auto update style
   const previousSize = [0, 0];
   function updateWindow() {
     // Canvas size
-    if (model.renderable) {
+    if (model.renderable && model.manageCanvas) {
       if (
         model.size[0] !== previousSize[0] ||
         model.size[1] !== previousSize[1]
@@ -161,7 +169,9 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
     }
 
     // Offscreen ?
-    model.canvas.style.display = model.useOffScreen ? 'none' : 'block';
+    if (model.manageCanvas) {
+      model.canvas.style.display = model.useOffScreen ? 'none' : 'block';
+    }
 
     // Cursor type
     if (model.el) {
@@ -307,25 +317,15 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
       powerPreference: 'high-performance',
     }
   ) => {
-    let result = null;
-
     const webgl2Supported = typeof WebGL2RenderingContext !== 'undefined';
-    model.webgl2 = false;
-    if (model.defaultToWebgl2 && webgl2Supported) {
-      result = model.canvas.getContext('webgl2', options);
-      if (result) {
-        model.webgl2 = true;
-        vtkDebugMacro('using webgl2');
-      }
+    const result = webgl2Supported
+      ? model.canvas.getContext('webgl2', options)
+      : null;
+    if (result) {
+      vtkDebugMacro('using WebGL2');
     }
     if (!result) {
-      vtkDebugMacro('using webgl1');
-      result =
-        model.canvas.getContext('webgl', options) ||
-        model.canvas.getContext('experimental-webgl', options);
-    }
-    if (!result) {
-      vtkErrorMacro('no webgl context');
+      vtkErrorMacro('no WebGL2 context');
     }
 
     return new Proxy(result, getCachingContextHandler());
@@ -382,25 +382,20 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
     oglNorm16Ext = null,
     useHalfFloat = false
   ) => {
-    if (model.webgl2) {
-      switch (vtkType) {
-        case VtkDataTypes.CHAR:
-        case VtkDataTypes.SIGNED_CHAR:
-        case VtkDataTypes.UNSIGNED_CHAR:
-          return 1;
-        case oglNorm16Ext:
-        case useHalfFloat:
-        case VtkDataTypes.UNSIGNED_SHORT:
-        case VtkDataTypes.SHORT:
-        case VtkDataTypes.VOID: // Used for unsigned int depth
-          return 2;
-        default: // For all other cases, assume float
-          return 4;
-      }
+    switch (vtkType) {
+      case VtkDataTypes.CHAR:
+      case VtkDataTypes.SIGNED_CHAR:
+      case VtkDataTypes.UNSIGNED_CHAR:
+        return 1;
+      case oglNorm16Ext:
+      case useHalfFloat:
+      case VtkDataTypes.UNSIGNED_SHORT:
+      case VtkDataTypes.SHORT:
+      case VtkDataTypes.VOID: // Used for unsigned int depth
+        return 2;
+      default: // For all other cases, assume float
+        return 4;
     }
-
-    // webgl1 type support is limited to 1 byte
-    return 1;
   };
 
   publicAPI.getDefaultTextureInternalFormat = (
@@ -409,78 +404,61 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
     oglNorm16Ext = null,
     useHalfFloat = false
   ) => {
-    if (model.webgl2) {
-      switch (vtktype) {
-        case VtkDataTypes.UNSIGNED_CHAR:
-          switch (numComps) {
-            case 1:
-              return model.context.R8;
-            case 2:
-              return model.context.RG8;
-            case 3:
-              return model.context.RGB8;
-            case 4:
-            default:
-              return model.context.RGBA8;
-          }
-        case oglNorm16Ext && !useHalfFloat && VtkDataTypes.UNSIGNED_SHORT:
-          switch (numComps) {
-            case 1:
-              return oglNorm16Ext.R16_EXT;
-            case 2:
-              return oglNorm16Ext.RG16_EXT;
-            case 3:
-              return oglNorm16Ext.RGB16_EXT;
-            case 4:
-            default:
-              return oglNorm16Ext.RGBA16_EXT;
-          }
-        // prioritize norm16 over float
-        case oglNorm16Ext && !useHalfFloat && VtkDataTypes.SHORT:
-          switch (numComps) {
-            case 1:
-              return oglNorm16Ext.R16_SNORM_EXT;
-            case 2:
-              return oglNorm16Ext.RG16_SNORM_EXT;
-            case 3:
-              return oglNorm16Ext.RGB16_SNORM_EXT;
-            case 4:
-            default:
-              return oglNorm16Ext.RGBA16_SNORM_EXT;
-          }
-        case VtkDataTypes.UNSIGNED_SHORT:
-        case VtkDataTypes.SHORT:
-        case VtkDataTypes.FLOAT:
-        default:
-          // useHalfFloat tells us if the texture can be accurately
-          // rendered with 16 bits or not.
-          switch (numComps) {
-            case 1:
-              return useHalfFloat ? model.context.R16F : model.context.R32F;
-            case 2:
-              return useHalfFloat ? model.context.RG16F : model.context.RG32F;
-            case 3:
-              return useHalfFloat ? model.context.RGB16F : model.context.RGB32F;
-            case 4:
-            default:
-              return useHalfFloat
-                ? model.context.RGBA16F
-                : model.context.RGBA32F;
-          }
-      }
-    }
-
-    // webgl1 only supports four types
-    switch (numComps) {
-      case 1:
-        return model.context.LUMINANCE;
-      case 2:
-        return model.context.LUMINANCE_ALPHA;
-      case 3:
-        return model.context.RGB;
-      case 4:
+    switch (vtktype) {
+      case VtkDataTypes.UNSIGNED_CHAR:
+        switch (numComps) {
+          case 1:
+            return model.context.R8;
+          case 2:
+            return model.context.RG8;
+          case 3:
+            return model.context.RGB8;
+          case 4:
+          default:
+            return model.context.RGBA8;
+        }
+      case oglNorm16Ext && !useHalfFloat && VtkDataTypes.UNSIGNED_SHORT:
+        switch (numComps) {
+          case 1:
+            return oglNorm16Ext.R16_EXT;
+          case 2:
+            return oglNorm16Ext.RG16_EXT;
+          case 3:
+            return oglNorm16Ext.RGB16_EXT;
+          case 4:
+          default:
+            return oglNorm16Ext.RGBA16_EXT;
+        }
+      // prioritize norm16 over float
+      case oglNorm16Ext && !useHalfFloat && VtkDataTypes.SHORT:
+        switch (numComps) {
+          case 1:
+            return oglNorm16Ext.R16_SNORM_EXT;
+          case 2:
+            return oglNorm16Ext.RG16_SNORM_EXT;
+          case 3:
+            return oglNorm16Ext.RGB16_SNORM_EXT;
+          case 4:
+          default:
+            return oglNorm16Ext.RGBA16_SNORM_EXT;
+        }
+      case VtkDataTypes.UNSIGNED_SHORT:
+      case VtkDataTypes.SHORT:
+      case VtkDataTypes.FLOAT:
       default:
-        return model.context.RGBA;
+        // useHalfFloat tells us if the texture can be accurately
+        // rendered with 16 bits or not.
+        switch (numComps) {
+          case 1:
+            return useHalfFloat ? model.context.R16F : model.context.R32F;
+          case 2:
+            return useHalfFloat ? model.context.RG16F : model.context.RG32F;
+          case 3:
+            return useHalfFloat ? model.context.RGB16F : model.context.RGB32F;
+          case 4:
+          default:
+            return useHalfFloat ? model.context.RGBA16F : model.context.RGBA32F;
+        }
     }
   };
 
@@ -550,15 +528,26 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
     if (model.deleted) {
       return null;
     }
+    // Captures with an explicit size or scale take the two-pass path below
+    // (placeholder image + canvas resize), which needs vtk.js to own the
+    // canvas. Fall back to a current-size capture otherwise.
+    let screenshotSize =
+      !!size || scale !== 1
+        ? size || model.size.map((val) => val * scale)
+        : null;
+    if (screenshotSize !== null && !model.manageCanvas) {
+      vtkWarningMacro(
+        'Ignoring the requested screenshot size/scale: resizing the canvas requires manageCanvas=true on vtkOpenGLRenderWindow. Capturing at the current size instead.'
+      );
+      screenshotSize = null;
+    }
+
     model.imageFormat = format;
     const previous = model.notifyStartCaptureImage;
     model.notifyStartCaptureImage = true;
 
     model._screenshot = {
-      size:
-        !!size || scale !== 1
-          ? size || model.size.map((val) => val * scale)
-          : null,
+      size: screenshotSize,
     };
 
     return new Promise((resolve, reject) => {
@@ -671,10 +660,10 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
     }
     const gl = publicAPI.get3DContext();
 
-    const glTextureFloat = gl.getExtension('OES_texture_float');
-    const glTextureHalfFloat = gl.getExtension('OES_texture_half_float');
+    // Float/halfFloat textures and multiple render targets are core in
+    // WebGL2; only float color renderability still hangs off an extension.
+    const glColorBufferFloat = gl.getExtension('EXT_color_buffer_float');
     const glDebugRendererInfo = gl.getExtension('WEBGL_debug_renderer_info');
-    const glDrawBuffers = gl.getExtension('WEBGL_draw_buffers');
     const glAnisotropic =
       gl.getExtension('EXT_texture_filter_anisotropic') ||
       gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic');
@@ -776,25 +765,17 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
         'Supported Formats for UByte Render Targets     ',
         'UNSIGNED_BYTE RENDER TARGET FORMATS',
         [
-          glTextureFloat &&
-          checkRenderTargetSupport(gl, gl.RGBA, gl.UNSIGNED_BYTE)
-            ? 'RGBA'
+          checkRenderTargetSupport(gl, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE)
+            ? 'RGBA8'
             : '',
-          glTextureFloat &&
-          checkRenderTargetSupport(gl, gl.RGB, gl.UNSIGNED_BYTE)
-            ? 'RGB'
+          checkRenderTargetSupport(gl, gl.RGB8, gl.RGB, gl.UNSIGNED_BYTE)
+            ? 'RGB8'
             : '',
-          glTextureFloat &&
-          checkRenderTargetSupport(gl, gl.LUMINANCE, gl.UNSIGNED_BYTE)
-            ? 'LUMINANCE'
+          checkRenderTargetSupport(gl, gl.RG8, gl.RG, gl.UNSIGNED_BYTE)
+            ? 'RG8'
             : '',
-          glTextureFloat &&
-          checkRenderTargetSupport(gl, gl.ALPHA, gl.UNSIGNED_BYTE)
-            ? 'ALPHA'
-            : '',
-          glTextureFloat &&
-          checkRenderTargetSupport(gl, gl.LUMINANCE_ALPHA, gl.UNSIGNED_BYTE)
-            ? 'LUMINANCE_ALPHA'
+          checkRenderTargetSupport(gl, gl.R8, gl.RED, gl.UNSIGNED_BYTE)
+            ? 'R8'
             : '',
         ].join(' '),
       ],
@@ -802,45 +783,17 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
         'Supported Formats for Half Float Render Targets',
         'HALF FLOAT RENDER TARGET FORMATS',
         [
-          glTextureHalfFloat &&
-          checkRenderTargetSupport(
-            gl,
-            gl.RGBA,
-            glTextureHalfFloat.HALF_FLOAT_OES
-          )
-            ? 'RGBA'
+          glColorBufferFloat &&
+          checkRenderTargetSupport(gl, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT)
+            ? 'RGBA16F'
             : '',
-          glTextureHalfFloat &&
-          checkRenderTargetSupport(
-            gl,
-            gl.RGB,
-            glTextureHalfFloat.HALF_FLOAT_OES
-          )
-            ? 'RGB'
+          glColorBufferFloat &&
+          checkRenderTargetSupport(gl, gl.RG16F, gl.RG, gl.HALF_FLOAT)
+            ? 'RG16F'
             : '',
-          glTextureHalfFloat &&
-          checkRenderTargetSupport(
-            gl,
-            gl.LUMINANCE,
-            glTextureHalfFloat.HALF_FLOAT_OES
-          )
-            ? 'LUMINANCE'
-            : '',
-          glTextureHalfFloat &&
-          checkRenderTargetSupport(
-            gl,
-            gl.ALPHA,
-            glTextureHalfFloat.HALF_FLOAT_OES
-          )
-            ? 'ALPHA'
-            : '',
-          glTextureHalfFloat &&
-          checkRenderTargetSupport(
-            gl,
-            gl.LUMINANCE_ALPHA,
-            glTextureHalfFloat.HALF_FLOAT_OES
-          )
-            ? 'LUMINANCE_ALPHA'
+          glColorBufferFloat &&
+          checkRenderTargetSupport(gl, gl.R16F, gl.RED, gl.HALF_FLOAT)
+            ? 'R16F'
             : '',
         ].join(' '),
       ],
@@ -848,30 +801,24 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
         'Supported Formats for Full Float Render Targets',
         'FLOAT RENDER TARGET FORMATS',
         [
-          glTextureFloat && checkRenderTargetSupport(gl, gl.RGBA, gl.FLOAT)
-            ? 'RGBA'
+          glColorBufferFloat &&
+          checkRenderTargetSupport(gl, gl.RGBA32F, gl.RGBA, gl.FLOAT)
+            ? 'RGBA32F'
             : '',
-          glTextureFloat && checkRenderTargetSupport(gl, gl.RGB, gl.FLOAT)
-            ? 'RGB'
+          glColorBufferFloat &&
+          checkRenderTargetSupport(gl, gl.RG32F, gl.RG, gl.FLOAT)
+            ? 'RG32F'
             : '',
-          glTextureFloat && checkRenderTargetSupport(gl, gl.LUMINANCE, gl.FLOAT)
-            ? 'LUMINANCE'
-            : '',
-          glTextureFloat && checkRenderTargetSupport(gl, gl.ALPHA, gl.FLOAT)
-            ? 'ALPHA'
-            : '',
-          glTextureFloat &&
-          checkRenderTargetSupport(gl, gl.LUMINANCE_ALPHA, gl.FLOAT)
-            ? 'LUMINANCE_ALPHA'
+          glColorBufferFloat &&
+          checkRenderTargetSupport(gl, gl.R32F, gl.RED, gl.FLOAT)
+            ? 'R32F'
             : '',
         ].join(' '),
       ],
       [
         'Max Multiple Render Targets Buffers',
-        'MAX_DRAW_BUFFERS_WEBGL',
-        glDrawBuffers
-          ? gl.getParameter(glDrawBuffers.MAX_DRAW_BUFFERS_WEBGL)
-          : 0,
+        'MAX_DRAW_BUFFERS',
+        gl.getParameter(gl.MAX_DRAW_BUFFERS),
       ],
       [
         'High Float Precision in Vertex Shader',
@@ -1060,7 +1007,7 @@ function vtkOpenGLRenderWindow(publicAPI, model) {
         glDebugRendererInfo &&
           gl.getParameter(glDebugRendererInfo.UNMASKED_VENDOR_WEBGL),
       ],
-      ['WebGL Version', 'WEBGL_VERSION', model.webgl2 ? 2 : 1],
+      ['WebGL Version', 'WEBGL_VERSION', 2],
     ];
 
     const result = {};
@@ -1316,6 +1263,7 @@ const DEFAULT_VALUES = {
   context: null,
   context2D: null,
   canvas: null,
+  manageCanvas: true,
   cursorVisibility: true,
   cursor: 'pointer',
   textureUnitManager: null,
@@ -1323,8 +1271,6 @@ const DEFAULT_VALUES = {
   containerSize: null,
   renderPasses: [],
   notifyStartCaptureImage: false,
-  webgl2: false,
-  defaultToWebgl2: true, // attempt webgl2 on by default
   activeFramebuffer: null,
   imageFormat: 'image/png',
   useOffScreen: false,
@@ -1375,7 +1321,6 @@ export function extend(publicAPI, model, initialValues = {}) {
   macro.get(publicAPI, model, [
     'shaderCache',
     'textureUnitManager',
-    'webgl2',
     'useBackgroundImage',
     'activeFramebuffer',
     'rootOpenGLRenderWindow',
@@ -1386,9 +1331,9 @@ export function extend(publicAPI, model, initialValues = {}) {
     'context',
     'context2D',
     'canvas',
+    'manageCanvas',
     'renderPasses',
     'notifyStartCaptureImage',
-    'defaultToWebgl2',
     'cursor',
     'useOffScreen',
   ]);
